@@ -1,0 +1,39 @@
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+scraping_*.log
+production_scraping.log
+
+# Temporary files
+*.tmp
+*.bak
+scraper_pid.txt
+debug_hltv_results.html
