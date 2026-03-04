@@ -7,12 +7,14 @@ from sklearn.metrics import log_loss, roc_auc_score, brier_score_loss
 from datetime import datetime
 import os
 import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
 
 SAVE_RESULTS = False
 RESULTS_FILE = "/media/vallu/Storage/Coding/Own_projects/betting_model/model/results_log.csv"
 RUN_NOTE = "logistic_combined_l5"
 PARQUET_DIR = "/media/vallu/Storage/Coding/Own_projects/betting_model/vallu_scraper/data/parquet"
 FEATURES_DIR = "/media/vallu/Storage/Coding/Own_projects/betting_model/vallu_scraper/data/features"
+TEAM_ELO_FILE = "/media/vallu/Storage/Coding/Own_projects/betting_model/vallu_scraper/data/features/team_elo/features_team_elo_130_50_25.parquet"
 
 con = duckdb.connect()
 
@@ -24,39 +26,23 @@ df = con.execute(f"""
 df['result'] = np.where(df['team1_score'] > df['team2_score'], 0, 1)
 df['is_lan'] = (df['event_type'] == 'LAN').astype(int)
 
-HIGH_K = 100
-LOW_K = 20
-THRESHOLD = 30
-df['team1_elo'] = None
-df['team2_elo'] = None
-df['elo_diff'] = None
-df['team1_games'] = None
-df['team2_games'] = None
-unique_teams = pd.unique(df[['team1_name', 'team2_name']].values.ravel())
-elo = {team: {'elo': 1500, 'games_played': 0} for team in unique_teams}
+# Compute games played per team (no Elo calculation here)
+df['team1_games'] = 0
+df['team2_games'] = 0
+games_played = {team: 0 for team in pd.unique(df[['team1_name', 'team2_name']].values.ravel())}
 
-def expected_score(elo_1, elo_2):
-    return 1 / (1 + 10 ** ((elo_2 - elo_1) / 400))
+for idx, row in df.iterrows():
+    team1 = row['team1_name']
+    team2 = row['team2_name']
+    df.at[idx, 'team1_games'] = games_played[team1]
+    df.at[idx, 'team2_games'] = games_played[team2]
+    games_played[team1] += 1
+    games_played[team2] += 1
 
-def update_elo(elo_1, elo_2, res, k1, k2):
-    ea = expected_score(elo_1, elo_2)
-    elo_1_new = elo_1 + k1 * ((1 - res) - ea)
-    elo_2_new = elo_2 + k2 * (res - (1 - ea))
-    return elo_1_new, elo_2_new
-
-for index, row in df.iterrows():
-    team1, team2 = row['team1_name'], row['team2_name']
-    df.at[index, 'team1_elo'] = elo[team1]['elo']
-    df.at[index, 'team2_elo'] = elo[team2]['elo']
-    df.at[index, 'elo_diff'] = elo[team1]['elo'] - elo[team2]['elo']
-    df.at[index, 'team1_games'] = elo[team1]['games_played']
-    df.at[index, 'team2_games'] = elo[team2]['games_played']
-    res = df.at[index, 'result']
-    k1 = HIGH_K if elo[team1]['games_played'] < THRESHOLD else LOW_K
-    k2 = HIGH_K if elo[team2]['games_played'] < THRESHOLD else LOW_K
-    elo[team1]['elo'], elo[team2]['elo'] = update_elo(elo[team1]['elo'], elo[team2]['elo'], res, k1, k2)
-    elo[team1]['games_played'] += 1
-    elo[team2]['games_played'] += 1
+# Merge precomputed team Elo features and derive elo_diff
+team_elo_df = pd.read_parquet(TEAM_ELO_FILE)
+df = df.merge(team_elo_df, on='hltv_match_id', how='left')
+df['elo_diff'] = df['team1_elo'] - df['team2_elo']
 
 rolling_df = pd.read_parquet(f"{FEATURES_DIR}/features_rolling_l5.parquet")[[
     'hltv_match_id',
@@ -85,6 +71,13 @@ filtered_df = df[
     (df['team2_rolling_rating_l5'].notna())
 ]
 
+print("\nElo diff summary (filtered data):")
+print(filtered_df['elo_diff'].describe())
+print(
+    f"Elo diff min={filtered_df['elo_diff'].min():.2f}, "
+    f"max={filtered_df['elo_diff'].max():.2f}"
+)
+
 feature_cols = [
     'elo_diff', 'rating_diff_l5', 'kast_diff_l5', 'swing_diff_l5',
     'team1_rolling_win_rate_l5', 'team2_rolling_win_rate_l5', 'is_lan'
@@ -94,8 +87,9 @@ train_df, test_df = train_test_split(filtered_df, test_size=0.2, shuffle=False)
 train_df = train_df.reset_index(drop=True)
 test_df = test_df.reset_index(drop=True)
 
-train_inputs = train_df[feature_cols]
-test_inputs = test_df[feature_cols]
+scaler = StandardScaler()
+train_inputs = scaler.fit_transform(train_df[feature_cols])
+test_inputs = scaler.transform(test_df[feature_cols])
 train_targets = train_df['result']
 test_targets = test_df['result']
 
@@ -153,6 +147,7 @@ print(f"Brier delta: {test_metrics['brier'] - train_metrics['brier']:+.3f} (over
 
 test_probs = model.predict_proba(test_inputs)[:, 1]
 odds_df = test_df[['hltv_match_id', 'team1_name', 'team2_name', 'result']].copy()
+odds_df['elo_diff'] = test_df['elo_diff']
 odds_df['team2_win_prob'] = test_probs
 odds_df['team1_win_prob'] = 1 - test_probs
 odds_df['team1_odds'] = 1 / odds_df['team1_win_prob']
@@ -161,7 +156,8 @@ odds_df = odds_df.round(2)
 
 start_id = 2385956
 start_idx = odds_df[odds_df['hltv_match_id'] >= start_id].index.min()
-print(odds_df[['hltv_match_id','team1_name', 'team2_name',
+print(odds_df[['hltv_match_id', 'team1_name', 'team2_name',
+               'elo_diff',
                'team1_win_prob', 'team2_win_prob',
                'team1_odds', 'team2_odds',
                'result']].iloc[start_idx:start_idx+100])

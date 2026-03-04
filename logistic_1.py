@@ -8,21 +8,18 @@ from datetime import datetime
 import os
 from sklearn.calibration import calibration_curve
 import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
 
 SAVE_RESULTS = False
 RESULTS_FILE = "/media/vallu/Storage/Coding/Own_projects/betting_model/model/results_log.csv"
 RUN_NOTE = "logistic"
 PARQUET_DIR = "/media/vallu/Storage/Coding/Own_projects/betting_model/vallu_scraper/data/parquet"
 FEATURES_DIR = "/media/vallu/Storage/Coding/Own_projects/betting_model/vallu_scraper/data/features"
+TEAM_ELO_FILE = (
+    "/media/vallu/Storage/Coding/Own_projects/betting_model/"
+    "vallu_scraper/data/features/team_elo/features_team_elo_110_20_13.parquet"
+)
 con = duckdb.connect()
-
-# K parameters: How much one match infuences ELO change
-# HIGH_K: Used for ELO calibration
-# LOW_K: Used after ELO is calibrated
-# THRESHOLD: Matches after which to switch to LOW_K
-HIGH_K = 100
-LOW_K = 20
-THRESHOLD = 30
 
 df = con.execute(f"""
     SELECT hltv_match_id, team1_name, team2_name, team1_score, team2_score, event_type
@@ -31,54 +28,41 @@ df = con.execute(f"""
 """).df()
 
 df['result'] = np.where(df['team1_score'] > df['team2_score'], 0, 1)
-df['is_lan'] = (df['event_type'] == 'LAN').astype(int)
-df['team1_elo'] = None
-df['team2_elo'] = None
-df['elo_diff'] = None
-df['team1_games'] = None
-df['team2_games'] = None
+df["is_lan"] = (df["event_type"] == "LAN").astype(int)
 
-# Init ELO to 1500 in separate dictionary
-unique_teams = pd.unique(df[['team1_name', 'team2_name']].values.ravel())
-elo = {
-    team: {
-        'elo': 1500,
-        'games_played': 0
-    }
-    for team in unique_teams
+# Games played per team (no Elo calculation here)
+df["team1_games"] = 0
+df["team2_games"] = 0
+games_played = {
+    team: 0
+    for team in pd.unique(df[["team1_name", "team2_name"]].values.ravel())
 }
 
-def expected_score(elo_1, elo_2):
-    return 1 / (1 + 10 ** ((elo_2 - elo_1) / 400))
+for idx, row in df.iterrows():
+    team1 = row["team1_name"]
+    team2 = row["team2_name"]
+    df.at[idx, "team1_games"] = games_played[team1]
+    df.at[idx, "team2_games"] = games_played[team2]
+    games_played[team1] += 1
+    games_played[team2] += 1
 
-def update_elo(elo_1, elo_2, res, k1, k2):
-    ea = expected_score(elo_1, elo_2)
-    elo_1_new = elo_1 + k1 * ((1 - res) - ea)
-    elo_2_new = elo_2 + k2 * (res - (1 - ea))
-    return elo_1_new, elo_2_new
-
-for index, row in df.iterrows():
-    team1, team2 = row['team1_name'], row['team2_name']
-    score1, score2 = row['team1_score'], row['team2_score']
-
-    # Store current ELO
-    df.at[index, 'team1_elo'] = elo[team1]['elo']
-    df.at[index, 'team2_elo'] = elo[team2]['elo']
-    df.at[index, 'elo_diff'] = elo[team1]['elo'] - elo[team2]['elo']
-    df.at[index, 'team1_games'] = elo[team1]['games_played']
-    df.at[index, 'team2_games'] = elo[team2]['games_played']
-
-    res = df.at[index, 'result']
-
-    # Set k
-    k1 = HIGH_K if elo[team1]['games_played'] < THRESHOLD else LOW_K
-    k2 = HIGH_K if elo[team2]['games_played'] < THRESHOLD else LOW_K
-
-    elo[team1]['elo'], elo[team2]['elo'] = update_elo(elo[team1]['elo'], elo[team2]['elo'], res, k1, k2)
-
-    # Increment games played
-    elo[team1]['games_played'] += 1
-    elo[team2]['games_played'] += 1
+# Merge precomputed team Elo features and derive elo_diff (if file present)
+if os.path.exists(TEAM_ELO_FILE):
+    team_elo_df = pd.read_parquet(TEAM_ELO_FILE)
+    required_team_cols = {"hltv_match_id", "team1_elo", "team2_elo"}
+    missing_team_cols = required_team_cols - set(team_elo_df.columns)
+    if missing_team_cols:
+        raise ValueError(
+            f"Missing expected team ELO columns in parquet: {sorted(missing_team_cols)}"
+        )
+    df = df.merge(
+        team_elo_df[["hltv_match_id", "team1_elo", "team2_elo"]],
+        on="hltv_match_id",
+        how="left",
+    )
+    df["elo_diff"] = df["team1_elo"] - df["team2_elo"]
+else:
+    raise FileNotFoundError(f"TEAM_ELO_FILE not found: {TEAM_ELO_FILE}")
 
 # Merge rolling features
 features_df = pd.read_parquet(f"{FEATURES_DIR}/features_rolling_l10.parquet")[[
@@ -102,8 +86,8 @@ df = df.merge(features_df, on='hltv_match_id', how='left')
 
 # Filter — also drop rows where rolling features are NaN (insufficient history)
 filtered_df = df[
-    (df['team1_games'] > 30) &
-    (df['team2_games'] > 30) &
+    (df['team1_games'] > 10) &
+    (df['team2_games'] > 10) &
     (df['team1_rolling_rating_l10'].notna()) &
     (df['team2_rolling_rating_l10'].notna())
 ]
@@ -134,8 +118,9 @@ feature_cols = [
     'team2_rolling_win_rate_l10',
     'is_lan',
 ]
-train_inputs = train_df[feature_cols]
-test_inputs = test_df[feature_cols]
+scaler = StandardScaler()
+train_inputs = scaler.fit_transform(train_df[feature_cols])
+test_inputs = scaler.transform(test_df[feature_cols])
 
 # Target
 train_targets = train_df['result']

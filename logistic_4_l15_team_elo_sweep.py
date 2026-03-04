@@ -1,7 +1,6 @@
 import os
 import re
 from typing import Dict, Any, List
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import duckdb
 import numpy as np
@@ -11,10 +10,16 @@ from sklearn.metrics import log_loss, roc_auc_score, brier_score_loss
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-PARQUET_DIR = "/media/vallu/Storage/Coding/Own_projects/betting_model/vallu_scraper/data/parquet"
-FEATURES_DIR = "/media/vallu/Storage/Coding/Own_projects/betting_model/vallu_scraper/data/features/map_elo"
 
-# Overfitting thresholds
+PARQUET_DIR = "/media/vallu/Storage/Coding/Own_projects/betting_model/vallu_scraper/data/parquet"
+FEATURES_ROOT = "/media/vallu/Storage/Coding/Own_projects/betting_model/vallu_scraper/data/features"
+MAP_ELO_FILE = (
+    "/media/vallu/Storage/Coding/Own_projects/betting_model/"
+    "vallu_scraper/data/features/map_elo/features_map_elo_190_90_17.parquet"
+)
+TEAM_ELO_DIR = os.path.join(FEATURES_ROOT, "team_elo")
+
+# Overfitting thresholds (same as logistic_4_l15_map_elo_sweep)
 MAX_LL_DELTA = 0.05   # test_log_loss - train_log_loss
 MAX_ROC_DELTA = 0.02  # train_roc_auc - test_roc_auc
 MAX_BR_DELTA = 0.01   # test_brier - train_brier
@@ -22,16 +27,26 @@ MAX_BR_DELTA = 0.01   # test_brier - train_brier
 
 def build_base_dataframe() -> pd.DataFrame:
     """
-    Build the part of the dataframe that is common for all runs:
+    Build the part of the dataframe that is common for all runs, mirroring logistic_4_l15:
     - match-level data
-    - simple team Elo
+    - simple team Elo (for games-played filtering)
     - rolling l15 features
+    - fixed map ELO features from MAP_ELO_FILE
     """
     con = duckdb.connect()
 
     df = con.execute(
         f"""
-        SELECT hltv_match_id, team1_name, team2_name, team1_score, team2_score, event_type
+        SELECT
+            hltv_match_id,
+            team1_name,
+            team2_name,
+            team1_score,
+            team2_score,
+            event_type,
+            is_bo1,
+            is_bo3,
+            is_bo5
         FROM '{PARQUET_DIR}/matches.parquet'
         ORDER BY hltv_match_id ASC
     """
@@ -40,14 +55,17 @@ def build_base_dataframe() -> pd.DataFrame:
     df["result"] = np.where(df["team1_score"] > df["team2_score"], 0, 1)
     df["is_lan"] = (df["event_type"] == "LAN").astype(int)
 
-    # Simple team-level Elo
+    for col in ["is_bo1", "is_bo3", "is_bo5"]:
+        df[col] = df[col].fillna(0).astype(int)
+
+    # Simple team-level Elo as in logistic_4_l15.py (used for games-played + optional comparison)
     HIGH_K = 100
     LOW_K = 20
     THRESHOLD = 30
 
-    df["team1_elo"] = None
-    df["team2_elo"] = None
-    df["elo_diff"] = None
+    df["team1_elo_simple"] = None
+    df["team2_elo_simple"] = None
+    df["elo_diff_simple"] = None
     df["team1_games"] = None
     df["team2_games"] = None
 
@@ -57,7 +75,9 @@ def build_base_dataframe() -> pd.DataFrame:
     def expected_score(elo_1: float, elo_2: float) -> float:
         return 1.0 / (1.0 + 10 ** ((elo_2 - elo_1) / 400.0))
 
-    def update_elo(elo_1: float, elo_2: float, res: int, k1: float, k2: float) -> tuple[float, float]:
+    def update_elo(
+        elo_1: float, elo_2: float, res: int, k1: float, k2: float
+    ) -> tuple[float, float]:
         ea = expected_score(elo_1, elo_2)
         elo_1_new = elo_1 + k1 * ((1 - res) - ea)
         elo_2_new = elo_2 + k2 * (res - (1 - ea))
@@ -65,9 +85,9 @@ def build_base_dataframe() -> pd.DataFrame:
 
     for idx, row in df.iterrows():
         team1, team2 = row["team1_name"], row["team2_name"]
-        df.at[idx, "team1_elo"] = elo[team1]["elo"]
-        df.at[idx, "team2_elo"] = elo[team2]["elo"]
-        df.at[idx, "elo_diff"] = elo[team1]["elo"] - elo[team2]["elo"]
+        df.at[idx, "team1_elo_simple"] = elo[team1]["elo"]
+        df.at[idx, "team2_elo_simple"] = elo[team2]["elo"]
+        df.at[idx, "elo_diff_simple"] = elo[team1]["elo"] - elo[team2]["elo"]
         df.at[idx, "team1_games"] = elo[team1]["games_played"]
         df.at[idx, "team2_games"] = elo[team2]["games_played"]
 
@@ -82,8 +102,10 @@ def build_base_dataframe() -> pd.DataFrame:
         elo[team1]["games_played"] += 1
         elo[team2]["games_played"] += 1
 
-    # Rolling l15 features
-    rolling_df = pd.read_parquet(os.path.join(FEATURES_DIR, "features_rolling_l15.parquet"))[
+    # Rolling l15 features (same as logistic_4_l15)
+    rolling_df = pd.read_parquet(
+        os.path.join(FEATURES_ROOT, "features_rolling_l15.parquet")
+    )[
         [
             "hltv_match_id",
             "team1_rolling_kast_l15",
@@ -104,15 +126,8 @@ def build_base_dataframe() -> pd.DataFrame:
 
     df = df.merge(rolling_df, on="hltv_match_id", how="left")
 
-    return df
-
-
-def run_single_map_elo_model(base_df: pd.DataFrame, map_elo_path: str) -> Dict[str, Any]:
-    """
-    Run the logistic_4_l15-style model for a single features_map_elo_XX_XX_XX.parquet file.
-    Returns a dict of metrics and metadata about this run.
-    """
-    map_elo_df = pd.read_parquet(map_elo_path)
+    # Fixed map ELO features (MAP_ELO_FILE constant like in logistic_4_l15)
+    map_elo_df = pd.read_parquet(MAP_ELO_FILE)
 
     maps_elo = [
         "ancient",
@@ -129,13 +144,45 @@ def run_single_map_elo_model(base_df: pd.DataFrame, map_elo_path: str) -> Dict[s
 
     missing_cols = [c for c in map_elo_cols if c not in map_elo_df.columns]
     if missing_cols:
-        raise ValueError(f"{os.path.basename(map_elo_path)} is missing expected columns: {missing_cols}")
+        raise ValueError(
+            f"Missing expected map ELO columns in MAP_ELO_FILE: {missing_cols}"
+        )
 
-    df = base_df.merge(
+    df = df.merge(
         map_elo_df[["hltv_match_id"] + map_elo_cols],
         on="hltv_match_id",
         how="left",
     )
+
+    return df, map_elo_cols
+
+
+def run_single_team_elo_model(
+    base_df: pd.DataFrame, map_elo_cols: List[str], team_elo_path: str
+) -> Dict[str, Any]:
+    """
+    Run the logistic_4_l15-style model for a single features_team_elo_XX_XX_XX.parquet file.
+    - Uses fixed map ELO features from MAP_ELO_FILE.
+    - Swaps in team ELO-based elo_diff from the parquet being swept.
+    Returns a dict of metrics and metadata about this run.
+    """
+    team_elo_df = pd.read_parquet(team_elo_path)
+
+    required_cols = {"hltv_match_id", "team1_elo", "team2_elo"}
+    missing = required_cols - set(team_elo_df.columns)
+    if missing:
+        raise ValueError(
+            f"{os.path.basename(team_elo_path)} is missing required columns: {sorted(missing)}"
+        )
+
+    df = base_df.merge(
+        team_elo_df[["hltv_match_id", "team1_elo", "team2_elo"]],
+        on="hltv_match_id",
+        how="left",
+    )
+
+    # elo_diff for the model is now taken from the swept team-elo parquet
+    df["elo_diff"] = df["team1_elo"] - df["team2_elo"]
 
     filtered_df = df[
         (df["team1_games"] > 10)
@@ -149,6 +196,8 @@ def run_single_map_elo_model(base_df: pd.DataFrame, map_elo_path: str) -> Dict[s
         "team1_rolling_win_rate_l15",
         "team2_rolling_win_rate_l15",
         "is_lan",
+        "is_bo3",
+        "is_bo5",
     ] + map_elo_cols
 
     train_df, test_df = train_test_split(filtered_df, test_size=0.2, shuffle=False)
@@ -164,14 +213,14 @@ def run_single_map_elo_model(base_df: pd.DataFrame, map_elo_path: str) -> Dict[s
     model = LogisticRegression(solver="liblinear")
     model.fit(train_inputs, train_targets)
 
-    # Coefficient-based feature importance for this run (printed summary, no plots to avoid spam)
+    # Coefficient-based feature importance for this run (printed summary, no plots)
     coef = model.coef_[0]
     coef_df = pd.DataFrame({"feature": feature_cols, "coef": coef})
     coef_df["abs_coef"] = coef_df["coef"].abs()
     coef_df = coef_df.sort_values("abs_coef", ascending=False)
 
     top_n = min(10, len(coef_df))
-    print(f"\nTop {top_n} features by |coef| for {os.path.basename(map_elo_path)}:")
+    print(f"\nTop {top_n} features by |coef| for {os.path.basename(team_elo_path)}:")
     print(coef_df.head(top_n).to_string(index=False, float_format="{:.4f}".format))
 
     def eval_split(inputs, targets):
@@ -195,8 +244,8 @@ def run_single_map_elo_model(base_df: pd.DataFrame, map_elo_path: str) -> Dict[s
         and br_delta <= MAX_BR_DELTA
     )
 
-    fname = os.path.basename(map_elo_path)
-    m = re.match(r"features_map_elo_(\d+)_(\d+)_(\d+)\.parquet", fname)
+    fname = os.path.basename(team_elo_path)
+    m = re.match(r"features_team_elo_(\d+)_(\d+)_(\d+)\.parquet", fname)
     high_k = int(m.group(1)) if m else None
     low_k = int(m.group(2)) if m else None
     threshold = int(m.group(3)) if m else None
@@ -223,52 +272,45 @@ def run_single_map_elo_model(base_df: pd.DataFrame, map_elo_path: str) -> Dict[s
 
 
 def main() -> None:
-    base_df = build_base_dataframe()
+    base_df, map_elo_cols = build_base_dataframe()
 
-    # Locate all features_map_elo_XX_XX_XX.parquet files
-    map_elo_files: List[str] = sorted(
-        os.path.join(FEATURES_DIR, f)
-        for f in os.listdir(FEATURES_DIR)
-        if f.startswith("features_map_elo_") and f.endswith(".parquet")
-    )
-
-    if not map_elo_files:
-        print(f"No features_map_elo_*.parquet files found in {FEATURES_DIR}")
+    # Locate all features_team_elo_XX_XX_XX.parquet files
+    if not os.path.isdir(TEAM_ELO_DIR):
+        print(f"TEAM_ELO_DIR does not exist: {TEAM_ELO_DIR}")
         return
 
-    print(f"Found {len(map_elo_files)} map ELO feature files.")
+    team_elo_files: List[str] = sorted(
+        os.path.join(TEAM_ELO_DIR, f)
+        for f in os.listdir(TEAM_ELO_DIR)
+        if f.startswith("features_team_elo_") and f.endswith(".parquet")
+    )
 
-    # Use multiple processes but always leave one core free.
-    cpu_count = os.cpu_count() or 4
-    max_workers = max(1, cpu_count - 1)
-    print(f"Running models in parallel with up to {max_workers} workers.")
+    if not team_elo_files:
+        print(f"No features_team_elo_*.parquet files found in {TEAM_ELO_DIR}")
+        return
+
+    print(f"Found {len(team_elo_files)} team ELO feature files.")
 
     all_results: List[Dict[str, Any]] = []
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        future_to_file = {
-            executor.submit(run_single_map_elo_model, base_df, path): path
-            for path in map_elo_files
-        }
-
-        for i, future in enumerate(as_completed(future_to_file), start=1):
-            path = future_to_file[future]
-            fname = os.path.basename(path)
-            try:
-                res = future.result()
-                all_results.append(res)
-                print(
-                    f"\n=== [{i}/{len(map_elo_files)}] Done {fname} ===\n"
-                    f"Train LL={res['train_log_loss']:.4f}, ROC={res['train_roc_auc']:.4f}, "
-                    f"Brier={res['train_brier']:.4f}\n"
-                    f"Test  LL={res['test_log_loss']:.4f}, ROC={res['test_roc_auc']:.4f}, "
-                    f"Brier={res['test_brier']:.4f}\n"
-                    f"dLL={res['ll_delta']:+.4f}, dROC={res['roc_delta']:+.4f}, "
-                    f"dBrier={res['br_delta']:+.4f}, "
-                    f"within_overfit_limits={res['within_overfit_limits']}"
-                )
-            except Exception as e:
-                print(f"❌ Failed for {fname}: {e}")
+    # Run sequentially (can be parallelized similarly to map_elo_sweep if needed)
+    for i, path in enumerate(team_elo_files, start=1):
+        fname = os.path.basename(path)
+        try:
+            res = run_single_team_elo_model(base_df, map_elo_cols, path)
+            all_results.append(res)
+            print(
+                f"\n=== [{i}/{len(team_elo_files)}] Done {fname} ===\n"
+                f"Train LL={res['train_log_loss']:.4f}, ROC={res['train_roc_auc']:.4f}, "
+                f"Brier={res['train_brier']:.4f}\n"
+                f"Test  LL={res['test_log_loss']:.4f}, ROC={res['test_roc_auc']:.4f}, "
+                f"Brier={res['test_brier']:.4f}\n"
+                f"dLL={res['ll_delta']:+.4f}, dROC={res['roc_delta']:+.4f}, "
+                f"dBrier={res['br_delta']:+.4f}, "
+                f"within_overfit_limits={res['within_overfit_limits']}"
+            )
+        except Exception as e:
+            print(f"❌ Failed for {fname}: {e}")
 
     if not all_results:
         print("No successful runs, nothing to summarize.")
@@ -315,14 +357,22 @@ def main() -> None:
         "br_delta",
         "score",
     ]
-    print(results_df[display_cols].to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+    print(
+        results_df[display_cols].to_string(
+            index=False, float_format=lambda x: f"{x:.4f}"
+        )
+    )
 
     print("\nTop 10 combinations within overfitting limits (best competition scores):")
     top_within = results_df[results_df["within_overfit_limits"]].head(10)
     if top_within.empty:
         print("No combinations satisfied the overfitting constraints.")
     else:
-        print(top_within[display_cols].to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+        print(
+            top_within[display_cols].to_string(
+                index=False, float_format=lambda x: f"{x:.4f}"
+            )
+        )
 
 
 if __name__ == "__main__":
